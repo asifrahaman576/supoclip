@@ -28,7 +28,7 @@ from fastapi import Depends
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["media"])
-MAX_VIDEO_UPLOAD_BYTES = 1_000_000_000
+MAX_VIDEO_UPLOAD_BYTES = 1536 * 1024 * 1024  # 1.5 GiB
 MAX_FONT_UPLOAD_BYTES = 10 * 1024 * 1024
 
 

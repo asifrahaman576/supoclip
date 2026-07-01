@@ -52,7 +52,7 @@ interface FontOption {
 
 type OutputFormat = "vertical" | "vertical_pan" | "vertical_split" | "original";
 
-const MAX_VIDEO_UPLOAD_BYTES = 1_000_000_000;
+const MAX_VIDEO_UPLOAD_BYTES = 1536 * 1024 * 1024; // 1.5 GiB
 
 type DirectUploadAuthorization = {
   directUpload: true;
@@ -123,7 +123,7 @@ async function requestUploadAuthorization(): Promise<UploadAuthorization> {
 
 async function uploadVideoFile(file: File): Promise<string> {
   if (file.size > MAX_VIDEO_UPLOAD_BYTES) {
-    throw new Error("Uploaded file is too large. Please upload a video under 1 GB.");
+    throw new Error("Uploaded file is too large. Please upload a video under 1.5 GB.");
   }
 
   const uploadAuthorization = await requestUploadAuthorization();
@@ -143,7 +143,7 @@ async function uploadVideoFile(file: File): Promise<string> {
   if (!uploadResponse.ok) {
     const fallbackMessage =
       uploadResponse.status === 413
-        ? "Uploaded file is too large. Please upload a video under 1 GB."
+        ? "Uploaded file is too large. Please upload a video under 1.5 GB."
         : `Upload error: ${uploadResponse.status}`;
     const uploadError = await parseApiError(uploadResponse, fallbackMessage);
     throw new Error(formatSupportMessage(uploadError));
