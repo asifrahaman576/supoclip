@@ -7,7 +7,12 @@ from typing import List, Dict, Any, Optional, Literal
 import asyncio
 import logging
 import re
+import traceback
+import json
+import httpx
 
+logging.getLogger("openai").setLevel(logging.DEBUG)
+logging.getLogger("httpx").setLevel(logging.DEBUG)
 from pydantic_ai import Agent
 from pydantic_ai.models import Model
 from pydantic_ai.models.ollama import OllamaModel
@@ -33,46 +38,42 @@ TRANSCRIPT_SPAN_RE = re.compile(
 class ViralityAnalysis(BaseModel):
     """Detailed virality breakdown for a segment."""
 
-    hook_score: int = Field(
-        default=15,
-        description="How strong is the opening hook (0-25)",
-        ge=0,
-        le=25,
-    )
-    engagement_score: int = Field(
-        default=15,
-        description="How engaging/entertaining is the content (0-25)",
-        ge=0,
-        le=25,
-    )
-    value_score: int = Field(
-        default=15,
-        description="Educational/informational value (0-25)",
-        ge=0,
-        le=25,
-    )
-    shareability_score: int = Field(
-        default=15,
-        description="Likelihood of being shared (0-25)",
-        ge=0,
-        le=25,
-    )
-    total_score: int = Field(
-        default=60,
-        description="Combined virality score (0-100)",
-        ge=0,
-        le=100,
-    )
-    hook_type: Optional[
-        Literal["question", "statement", "statistic", "story", "contrast", "none"]
-    ] = Field(
-        default="none",
-        description="Type of hook: question, statement, statistic, story, contrast, or none",
-    )
+    hook_score: int = Field(default=15, description="How strong is the opening hook (0-25)")
+    engagement_score: int = Field(default=15, description="How engaging/entertaining is the content (0-25)")
+    value_score: int = Field(default=15, description="Educational/informational value (0-25)")
+    shareability_score: int = Field(default=15, description="Likelihood of being shared (0-25)")
+    total_score: int = Field(default=60, description="Combined virality score (0-100)")
+    hook_type: Optional[str] = Field(default="none", description="Type of hook")
     virality_reasoning: str = Field(
         default="The model did not provide a detailed virality breakdown.",
         description="Explanation of the virality score",
     )
+
+    @field_validator("hook_score", "engagement_score", "value_score", "shareability_score", mode="before")
+    @classmethod
+    def _normalize_score(cls, value: Any) -> int:
+        if value is None:
+            return 0
+        try:
+            val = float(value)
+            if val > 25:
+                val = val / 4
+            return int(round(val))
+        except (ValueError, TypeError):
+            return 0
+
+    @field_validator("total_score", mode="before")
+    @classmethod
+    def _normalize_total(cls, value: Any) -> int:
+        if value is None:
+            return 0
+        try:
+            val = float(value)
+            if val > 100:
+                val = 100
+            return int(round(val))
+        except (ValueError, TypeError):
+            return 0
 
 
 def _default_virality_analysis() -> ViralityAnalysis:
@@ -93,7 +94,9 @@ class TranscriptSegment(BaseModel):
     )
     relevance_score: float = Field(
         default=0.75,
-        description="Relevance score from 0.0 to 1.0", ge=0.0, le=1.0
+        description="Relevance score from 0.0 to 1.0",
+        ge=0.0,
+        le=1.0
     )
     reasoning: str = Field(
         default="Selected by the AI model as a clip candidate.",
@@ -111,14 +114,25 @@ class TranscriptSegment(BaseModel):
     @classmethod
     def _coerce_percent_relevance_score(cls, value: Any) -> Any:
         if value is None:
-            return value
+            return 0.0
         try:
             numeric_value = float(value)
         except (TypeError, ValueError):
-            return value
+            return 0.0
         if numeric_value > 1 and numeric_value <= 100:
             return numeric_value / 100
-        return value
+        if numeric_value > 100:
+            return 1.0
+        if numeric_value < 0:
+            return 0.0
+        return numeric_value
+
+    @field_validator("start_time", "end_time", mode="before")
+    @classmethod
+    def _validate_timestamp(cls, value: Any) -> str:
+        if value is None:
+            return "00:00"
+        return str(value)
 
 
 class BRollOpportunity(BaseModel):
@@ -155,25 +169,84 @@ class BRollOpportunity(BaseModel):
             return ", ".join(str(item) for item in value if item is not None)
         return str(value)
 
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def _validate_timestamp(cls, value: Any) -> str:
+        if value is None:
+            return "00:00"
+        return str(value)
+
 
 class TranscriptAnalysis(BaseModel):
     """Analysis result for transcript segments with virality and B-roll opportunities."""
 
     most_relevant_segments: List[TranscriptSegment]
-    summary: str = Field(description="Brief summary of the video content")
-    key_topics: List[str] = Field(description="List of main topics discussed")
+    summary: str = Field(
+        default="No summary provided.",
+        description="Brief summary of the video content"
+    )
+    key_topics: List[str] = Field(
+        default_factory=list,
+        description="List of main topics discussed"
+    )
     broll_opportunities: Optional[List[BRollOpportunity]] = Field(
         default=None, description="Opportunities to insert B-roll footage"
     )
 
+    @field_validator("key_topics", mode="before")
+    @classmethod
+    def _normalize_key_topics(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            result = []
+            for item in value:
+                if isinstance(item, dict):
+                    if "topic" in item:
+                        result.append(str(item["topic"]))
+                    elif "name" in item:
+                        result.append(str(item["name"]))
+                    elif "title" in item:
+                        result.append(str(item["title"]))
+                    else:
+                        result.append(str(item))
+                elif isinstance(item, str):
+                    result.append(item)
+                else:
+                    result.append(str(item))
+            return result
+        return []
 
-# Enhanced system prompt with virality scoring and B-roll detection
+    @field_validator("summary", mode="before")
+    @classmethod
+    def _normalize_summary(cls, value: Any) -> str:
+        if value is None:
+            return "No summary provided."
+        if isinstance(value, dict):
+            for key in ["summary", "text", "content", "description"]:
+                if key in value:
+                    return str(value[key])
+            return str(value)
+        return str(value)
+
+    @field_validator("most_relevant_segments", mode="before")
+    @classmethod
+    def _validate_segments(cls, value: Any) -> List[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        return []
+
+
+# Enhanced system prompt with explicit JSON structural guidelines
 transcript_analysis_system_prompt = """You are an expert transcript analyst for short-form video editing.
 
 Your job is extraction and ranking, not creative rewriting. You must stay fully grounded in the transcript and choose the best clip candidates that already exist in the source material.
 
 OUTPUT CONTRACT:
 - Return valid JSON only. Do not output Markdown, headings, bullets, prose, code fences, explanations, or commentary outside the JSON object.
+- Never wrap the output in markdown code blocks like ```json ... ```. Start output directly with the opening curly brace '{'.
 - The top-level JSON object must include: "most_relevant_segments", "summary", and "key_topics".
 - Only include "broll_opportunities" when B-roll was requested.
 - Each item in "most_relevant_segments" must include: "start_time", "end_time", "text", "relevance_score", "reasoning", and "virality".
@@ -291,8 +364,7 @@ SCORING AND OUTPUT RULES:
 
 Find 2-5 compelling segments that would work well as standalone clips. Quality over quantity: choose fewer stronger segments over filling a quota. Every selected segment must be accurate, self-contained, have proper time ranges, and score high on virality metrics."""
 
-# Lazy-loaded agent to avoid import-time failures when API keys aren't set
-_transcript_agent: Optional[Agent[None, TranscriptAnalysis]] = None
+_transcript_agent: Optional[Agent[None, str]] = None
 _transcript_agent_signature: Optional[tuple[str | None, ...]] = None
 
 SUPPORTED_LLM_PROVIDERS = {"google", "google-gla", "openai", "anthropic", "ollama"}
@@ -307,7 +379,6 @@ def _split_llm_name(model_name: str) -> tuple[str, str | None]:
 
 
 def _get_missing_llm_key_error(model_name: str, runtime_config: Config) -> Optional[str]:
-    """Return a clear configuration error when the selected LLM key is missing."""
     provider, provider_model_name = _split_llm_name(model_name)
 
     if provider not in SUPPORTED_LLM_PROVIDERS:
@@ -340,39 +411,29 @@ def _get_missing_llm_key_error(model_name: str, runtime_config: Config) -> Optio
             "Set ANTHROPIC_API_KEY or choose another provider with a matching API key."
         )
 
-    if provider == "ollama":
-        # Ollama can run locally without an API key. OLLAMA_BASE_URL/OLLAMA_API_KEY
-        # are optional and passed through as environment variables.
-        return None
-
     return None
 
 
 def _build_transcript_model(runtime_config: Config) -> Model | str:
     provider, provider_model_name = _split_llm_name(runtime_config.llm)
-    if provider != "ollama":
-        return runtime_config.llm
-
-    if not provider_model_name:
-        raise RuntimeError(
-            "Selected LLM provider is Ollama, but no model name was provided. "
-            "Use the format ollama:<model>, for example ollama:gpt-oss:20b."
+    
+    if provider == "ollama" or (provider == "openai" and "qwen" in (provider_model_name or "").lower()):
+        model_name = provider_model_name or "qwen3:8b"
+        logger.info("Routing request through native PydanticAI Ollama provider for %s", model_name)
+        return OllamaModel(
+            model_name,
+            provider=OllamaProvider(
+                base_url=runtime_config.resolve_ollama_base_url(),
+                api_key=runtime_config.ollama_api_key,
+            ),
         )
 
-    return OllamaModel(
-        provider_model_name,
-        provider=OllamaProvider(
-            base_url=runtime_config.resolve_ollama_base_url(),
-            api_key=runtime_config.ollama_api_key,
-        ),
-    )
+    return runtime_config.llm
 
 
-def get_transcript_agent() -> Agent[None, TranscriptAnalysis]:
-    """Get or create the transcript analysis agent (lazy initialization)."""
+def get_transcript_agent() -> Agent[None, str]:
     global _transcript_agent, _transcript_agent_signature
     runtime_config = get_config()
-    provider, _ = _split_llm_name(runtime_config.llm)
     signature = (
         runtime_config.llm,
         runtime_config.openai_api_key,
@@ -387,14 +448,9 @@ def get_transcript_agent() -> Agent[None, TranscriptAnalysis]:
         if config_error:
             raise RuntimeError(config_error)
 
-        _transcript_agent = Agent[None, TranscriptAnalysis](
+        _transcript_agent = Agent[None, str](
             model=_build_transcript_model(runtime_config),
-            output_type=TranscriptAnalysis,
             system_prompt=transcript_analysis_system_prompt,
-            # Some local Ollama/OpenAI-compatible endpoints can return formatted
-            # prose before settling on schema-valid JSON. Keep retries limited
-            # while still allowing enough repair attempts for local models.
-            output_retries=2 if provider == "ollama" else 2,
         )
         _transcript_agent_signature = signature
     return _transcript_agent
@@ -403,7 +459,6 @@ def get_transcript_agent() -> Agent[None, TranscriptAnalysis]:
 def build_transcript_analysis_prompt(
     transcript: str, include_broll: bool = False, clip_signals: str | None = None
 ) -> str:
-    """Build the grounded task prompt for transcript analysis."""
     broll_instruction = ""
     if include_broll:
         broll_instruction = (
@@ -461,7 +516,6 @@ Transcript:
 
 
 def _parse_transcript_timestamp_seconds(timestamp: str) -> int:
-    """Parse MM:SS or HH:MM:SS transcript timestamps into seconds."""
     parts = [int(part) for part in timestamp.split(":")]
     if len(parts) == 2:
         minutes, seconds = parts
@@ -473,7 +527,6 @@ def _parse_transcript_timestamp_seconds(timestamp: str) -> int:
 
 
 def _format_transcript_timestamp(seconds: int) -> str:
-    """Format seconds as a transcript timestamp."""
     seconds = max(0, int(seconds))
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -483,7 +536,6 @@ def _format_transcript_timestamp(seconds: int) -> str:
 
 
 def _parse_transcript_spans(transcript: str) -> list[dict[str, Any]]:
-    """Parse timestamped transcript lines into spans."""
     spans = []
     for line in transcript.splitlines():
         match = TRANSCRIPT_SPAN_RE.match(line.strip())
@@ -509,7 +561,6 @@ def _parse_transcript_spans(transcript: str) -> list[dict[str, Any]]:
 def _extract_transcript_text(
     transcript_spans: list[dict[str, Any]], start_seconds: int, end_seconds: int
 ) -> str:
-    """Return transcript text overlapping a selected time range."""
     selected_text = [
         span["text"]
         for span in transcript_spans
@@ -523,7 +574,6 @@ def _extract_transcript_text(
 def _choose_repaired_bounds(
     transcript_spans: list[dict[str, Any]], start_seconds: int, end_seconds: int
 ) -> tuple[int, int] | None:
-    """Repair model-selected bounds to the nearest acceptable contiguous range."""
     if not transcript_spans:
         return None
 
@@ -592,164 +642,144 @@ def _repair_segment_bounds(
     repaired_start, repaired_end = repaired_bounds
     segment.start_time = _format_transcript_timestamp(repaired_start)
     segment.end_time = _format_transcript_timestamp(repaired_end)
-    repaired_text = _extract_transcript_text(
+    segment.text = _extract_transcript_text(
         transcript_spans,
         repaired_start,
         repaired_end,
     )
-    if repaired_text:
-        segment.text = repaired_text
-    logger.info(
-        "Repaired segment duration: %s-%s -> %s-%s",
-        _format_transcript_timestamp(start_seconds),
-        _format_transcript_timestamp(end_seconds),
-        segment.start_time,
-        segment.end_time,
-    )
-    return repaired_start, repaired_end
+    return repaired_bounds
+
+
+def _clean_markdown_json(raw_text: str) -> str:
+    """Remove markdown formatting from JSON responses."""
+    if not raw_text:
+        return ""
+    
+    text = raw_text.strip()
+    
+    if text.startswith("```"):
+        lines = text.split("\n")
+        start_idx = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith("```"):
+                start_idx = i + 1
+                break
+        
+        end_idx = len(lines)
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].strip().startswith("```"):
+                end_idx = i
+                break
+        
+        json_lines = lines[start_idx:end_idx]
+        text = "\n".join(json_lines).strip()
+    
+    json_start = text.find("{")
+    json_end = text.rfind("}")
+    if json_start != -1 and json_end != -1 and json_start < json_end:
+        text = text[json_start:json_end + 1]
+    
+    return text
 
 
 async def get_most_relevant_parts_by_transcript(
-    transcript: str, include_broll: bool = False, clip_signals: str | None = None
+    transcript_text: str,
+    include_broll: bool = False,
+    clip_signals: str | None = None,
 ) -> TranscriptAnalysis:
-    """Get the most relevant parts of a transcript with virality scoring and optional B-roll detection."""
-    logger.info(
-        f"Starting AI analysis of transcript ({len(transcript)} chars), include_broll={include_broll}"
+    """
+    Get most relevant parts from transcript using PydanticAI with Ollama.
+    """
+    # Validate input
+    if not transcript_text or not transcript_text.strip():
+        raise ValueError("Transcript text is empty or contains only whitespace")
+    
+    # Clean transcript
+    transcript_text = transcript_text.strip()
+    
+    # Build prompt
+    prompt = build_transcript_analysis_prompt(
+        transcript_text, 
+        include_broll=include_broll,
+        clip_signals=clip_signals
     )
-
-    try:
-        agent = get_transcript_agent()
-
-        result = await agent.run(
-            build_transcript_analysis_prompt(
-                transcript=transcript,
-                include_broll=include_broll,
-                clip_signals=clip_signals,
-            )
-        )
-
-        analysis = result.output
-        logger.info(
-            f"AI analysis found {len(analysis.most_relevant_segments)} segments"
-        )
-
-        # Validation with virality data handling
-        validated_segments = []
-        transcript_spans = _parse_transcript_spans(transcript)
+    
+    if not prompt or not prompt.strip():
+        raise ValueError("Generated prompt is empty")
+    
+    logger.info(f"Prompt length: {len(prompt)} characters")
+    logger.info(f"First 200 chars: {prompt[:200]}...")
+    
+    # Get runtime config
+    runtime_config = get_config()
+    
+    # Build model using PydanticAI
+    model = _build_transcript_model(runtime_config)
+    
+    # Create a fresh agent
+    agent = Agent[None, str](
+        model=model,
+        system_prompt=transcript_analysis_system_prompt,
+    )
+    
+    # Run the agent
+    result = await agent.run(prompt)
+    
+    # For pydantic-ai 1.89.1, the response is in result.output
+    if not result or not hasattr(result, 'output'):
+        logger.error(f"Result object: {type(result)}")
+        logger.error(f"Result attributes: {dir(result) if result else 'None'}")
+        raise ValueError("Invalid result object from LLM")
+    
+    response_text = result.output
+    if not response_text or not response_text.strip():
+        raise ValueError("Empty response from LLM")
+    
+    # Clean response
+    response_text = response_text.strip()
+    
+    logger.info(f"Response length: {len(response_text)} characters")
+    logger.info(f"First 200 chars: {response_text[:200]}...")
+    
+    # Clean markdown if present
+    cleaned_text = _clean_markdown_json(response_text)
+    if not cleaned_text:
+        raise ValueError("No JSON content found in response")
+    
+    # Parse into dictionary
+    data = json.loads(cleaned_text)
+    
+    # Validate required fields
+    if "most_relevant_segments" not in data:
+        raise ValueError("Response missing 'most_relevant_segments' field")
+    
+    if not data["most_relevant_segments"]:
+        raise ValueError("Response has empty segments list")
+    
+    # Parse into TranscriptAnalysis with relaxed validation
+    analysis = TranscriptAnalysis(**data)
+    
+    # Post-process and validate segments
+    transcript_spans = _parse_transcript_spans(transcript_text)
+    if transcript_spans:
+        repaired_count = 0
         for segment in analysis.most_relevant_segments:
-            # Validate text content
-            if not segment.text.strip() or len(segment.text.split()) < 3:
-                logger.warning(
-                    f"Skipping segment with insufficient content: '{segment.text[:50]}...'"
-                )
-                continue
-
-            # Validate timestamps - CRITICAL: start and end must be different
-            if segment.start_time == segment.end_time:
-                logger.warning(
-                    f"Skipping segment with identical start/end times: {segment.start_time}"
-                )
-                continue
-
-            # Parse timestamps to validate duration
             try:
-                start_seconds = _parse_transcript_timestamp_seconds(
-                    segment.start_time
-                )
+                start_seconds = _parse_transcript_timestamp_seconds(segment.start_time)
                 end_seconds = _parse_transcript_timestamp_seconds(segment.end_time)
-
+                
                 duration = end_seconds - start_seconds
-
                 if duration < MIN_ACCEPTED_CLIP_SECONDS or duration > MAX_ACCEPTED_CLIP_SECONDS:
-                    repaired_bounds = _repair_segment_bounds(
-                        segment,
-                        transcript_spans,
-                        start_seconds,
-                        end_seconds,
+                    repaired = _repair_segment_bounds(
+                        segment, transcript_spans, start_seconds, end_seconds
                     )
-                    if repaired_bounds:
-                        start_seconds, end_seconds = repaired_bounds
-                        duration = end_seconds - start_seconds
-
-                if duration <= 0:
-                    logger.warning(
-                        f"Skipping segment with invalid duration: {segment.start_time} to {segment.end_time} = {duration}s"
-                    )
-                    continue
-
-                if duration < MIN_ACCEPTED_CLIP_SECONDS:
-                    logger.warning(
-                        f"Skipping segment too short: {duration}s (min {MIN_ACCEPTED_CLIP_SECONDS}s required)"
-                    )
-                    continue
-
-                if duration > MAX_ACCEPTED_CLIP_SECONDS:
-                    logger.warning(
-                        f"Skipping segment too long: {duration}s (max {MAX_ACCEPTED_CLIP_SECONDS}s allowed)"
-                    )
-                    continue
-
-                # Validate virality scores
-                if segment.virality:
-                    # Ensure total score is sum of subscores
-                    calculated_total = (
-                        segment.virality.hook_score
-                        + segment.virality.engagement_score
-                        + segment.virality.value_score
-                        + segment.virality.shareability_score
-                    )
-                    if segment.virality.total_score != calculated_total:
-                        logger.warning(
-                            f"Correcting virality total: {segment.virality.total_score} -> {calculated_total}"
-                        )
-                        segment.virality.total_score = calculated_total
-
-                validated_segments.append(segment)
-                virality_info = (
-                    f", virality={segment.virality.total_score}"
-                    if segment.virality
-                    else ""
-                )
-                logger.info(
-                    f"Validated segment: {segment.start_time}-{segment.end_time} ({duration}s){virality_info}"
-                )
-
-            except (ValueError, IndexError) as e:
-                logger.warning(
-                    f"Skipping segment with invalid timestamp format: {segment.start_time}-{segment.end_time}: {e}"
-                )
-                continue
-
-        # Sort by virality score (primary) then relevance (secondary)
-        validated_segments.sort(
-            key=lambda x: (
-                x.virality.total_score if x.virality else 0,
-                x.relevance_score,
-            ),
-            reverse=True,
-        )
-
-        final_analysis = TranscriptAnalysis(
-            most_relevant_segments=validated_segments,
-            summary=analysis.summary,
-            key_topics=analysis.key_topics,
-            broll_opportunities=analysis.broll_opportunities if include_broll else None,
-        )
-
-        logger.info(f"Selected {len(validated_segments)} segments for processing")
-        if validated_segments:
-            top = validated_segments[0]
-            logger.info(
-                f"Top segment - relevance: {top.relevance_score:.2f}, virality: {top.virality.total_score if top.virality else 'N/A'}"
-            )
-
-        return final_analysis
-
-    except Exception as e:
-        logger.error(f"Error in transcript analysis: {e}")
-        raise RuntimeError(f"Transcript analysis failed: {str(e)}") from e
-
-
-def get_most_relevant_parts_sync(transcript: str) -> TranscriptAnalysis:
-    """Synchronous wrapper for the async function."""
-    return asyncio.run(get_most_relevant_parts_by_transcript(transcript))
+                    if repaired:
+                        repaired_count += 1
+            except Exception as e:
+                logger.warning(f"Could not repair segment bounds: {e}")
+        
+        if repaired_count > 0:
+            logger.info(f"Repaired {repaired_count} segment bounds")
+    
+    logger.info(f"Successfully parsed {len(analysis.most_relevant_segments)} segments")
+    return analysis
