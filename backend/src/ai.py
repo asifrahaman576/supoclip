@@ -105,10 +105,21 @@ class TranscriptSegment(BaseModel):
             "Base it only on the provided transcript content."
         )
     )
-    virality: ViralityAnalysis = Field(
-        default_factory=_default_virality_analysis,
-        description="Detailed virality score breakdown",
+    virality: Optional[ViralityAnalysis] = Field(
+        default=None,
+        description="Detailed virality score breakdown (optional)",
     )
+
+    @field_validator("virality", mode="before")
+    @classmethod
+    def _normalize_virality(cls, value: Any) -> Optional[ViralityAnalysis]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return ViralityAnalysis(virality_reasoning=f"Virality level: {value}")
+        if isinstance(value, dict):
+            return ViralityAnalysis(**value)
+        return value
 
     @field_validator("relevance_score", mode="before")
     @classmethod
@@ -239,130 +250,39 @@ class TranscriptAnalysis(BaseModel):
         return []
 
 
-# Enhanced system prompt with explicit JSON structural guidelines
-transcript_analysis_system_prompt = """You are an expert transcript analyst for short-form video editing.
+# SIMPLIFIED SYSTEM PROMPT - Very short and direct
+transcript_analysis_system_prompt = """You are a transcript analyzer that outputs ONLY valid JSON.
 
-Your job is extraction and ranking, not creative rewriting. You must stay fully grounded in the transcript and choose the best clip candidates that already exist in the source material.
+Your response must be a JSON object with this exact structure:
+{
+  "most_relevant_segments": [
+    {
+      "start_time": "MM:SS",
+      "end_time": "MM:SS",
+      "text": "exact transcript text",
+      "relevance_score": 0.75,
+      "reasoning": "brief explanation",
+      "virality": {
+        "hook_score": 15,
+        "engagement_score": 15,
+        "value_score": 15,
+        "shareability_score": 15,
+        "total_score": 60,
+        "hook_type": "statement",
+        "virality_reasoning": "explanation"
+      }
+    }
+  ],
+  "summary": "brief summary",
+  "key_topics": ["topic1", "topic2"]
+}
 
-OUTPUT CONTRACT:
-- Return valid JSON only. Do not output Markdown, headings, bullets, prose, code fences, explanations, or commentary outside the JSON object.
-- Never wrap the output in markdown code blocks like ```json ... ```. Start output directly with the opening curly brace '{'.
-- The top-level JSON object must include: "most_relevant_segments", "summary", and "key_topics".
-- Only include "broll_opportunities" when B-roll was requested.
-- Each item in "most_relevant_segments" must include: "start_time", "end_time", "text", "relevance_score", "reasoning", and "virality".
-- Do not use "segment" as an output field. Use "text".
-- "virality" must include: "hook_score", "engagement_score", "value_score", "shareability_score", "total_score", "hook_type", and "virality_reasoning".
-- Every returned segment must be 15-60 seconds long. Prefer 25-50 seconds.
-
-CORE OBJECTIVES:
-1. Identify segments that would be compelling on social media platforms
-2. Focus on complete thoughts, insights, or entertaining moments
-3. Prioritize content with hooks, emotional moments, or valuable information
-4. Each segment should be engaging and worth watching
-5. Score each segment's viral potential with detailed breakdown
-
-GROUNDING RULES:
-1. Use only the provided transcript lines and timestamps
-2. Never invent facts, tone, context, or transitions that are not present
-3. Treat this as span selection over a timestamped transcript, not open-ended summarization
-4. Each selected segment must map to one contiguous range in the transcript
-5. segment.text must match the chosen span closely and must not include content from outside the chosen range
-6. Do not stitch together distant moments into one clip
-7. If a speaker label appears, use it only if it is part of the spoken content and helps clarity
-
-CONTENT NEUTRALITY RULES:
-1. This is clipping software for legitimate editing workflows
-2. Do not judge, moralize, or downgrade a segment just because the topic is controversial, sensitive, adult, political, criminal, medical, or otherwise intense
-3. Evaluate segments only on clip quality: clarity, self-contained value, hook strength, emotional impact, specificity, and shareability
-4. Do not refuse analysis just because the speaker describes risky, offensive, or uncomfortable subject matter
-5. Only downgrade a segment when the transcript itself is weak, confusing, repetitive, unusable, or a poor standalone clip
-
-SEGMENT SELECTION CRITERIA:
-1. STRONG HOOKS: Attention-grabbing opening lines
-2. VALUABLE CONTENT: Tips, insights, interesting facts, stories
-3. EMOTIONAL MOMENTS: Excitement, surprise, humor, inspiration
-4. COMPLETE THOUGHTS: Self-contained ideas that make sense alone
-5. ENTERTAINING: Content people would want to share
-6. HIGH SIGNAL: Prefer specific, concrete language over vague discussion
-7. LOW FILLER: Avoid greetings, sponsor reads, repeated setup, throat-clearing, and housekeeping unless they are unusually compelling
-
-WHAT A GOOD CLIP FEELS LIKE:
-- A viewer should understand and care without the original title, thumbnail, or previous context
-- Prefer a complete mini-story or argument: setup, tension or claim, specific detail, and payoff
-- Expand a great short moment to nearby contiguous lines when that adds needed setup, stakes, or payoff
-- Strong picks include contrarian claims, mistakes or lessons, concrete examples, before/after moments, frameworks, surprising results, emotionally charged reactions, and complete answers to interesting questions
-- Bad picks include intros, sponsor or CTA sections, vague setup, contextless quote fragments, repeated points, definitions without payoff, meandering background, and answer fragments that require unseen context
-
-VIRALITY SCORING (0-100 total, from four 0-25 subscores):
-For each segment, provide a detailed virality breakdown:
-
-1. HOOK STRENGTH (0-25):
-   - 20-25: Immediately grabs attention (surprising fact, bold claim, intriguing question)
-   - 15-19: Good opener that creates curiosity
-   - 10-14: Decent start but could be stronger
-   - 0-9: Weak or no hook
-
-2. ENGAGEMENT (0-25):
-   - 20-25: Highly entertaining, emotional, or dramatic
-   - 15-19: Interesting and holds attention
-   - 10-14: Moderately engaging
-   - 0-9: Flat or boring delivery
-
-3. VALUE (0-25):
-   - 20-25: Actionable insights, unique knowledge, or transformative ideas
-   - 15-19: Useful information most people don't know
-   - 10-14: Somewhat informative
-   - 0-9: Common knowledge or filler content
-
-4. SHAREABILITY (0-25):
-   - 20-25: "I need to send this to someone" content
-   - 15-19: Content worth bookmarking
-   - 10-14: Nice but not share-worthy
-   - 0-9: Generic content
-
-HOOK TYPES to identify:
-- "question": Opens with a question that creates curiosity
-- "statement": Bold claim or surprising statement
-- "statistic": Uses compelling numbers or data
-- "story": Starts with narrative/anecdote
-- "contrast": Before/after or problem/solution framing
-- "none": No clear hook pattern
-
-B-ROLL OPPORTUNITIES:
-Identify 2-4 moments in each segment where B-roll footage could enhance the video:
-- When specific objects, places, or concepts are mentioned
-- During explanations that could benefit from visual illustration
-- At emotional peaks that could use supporting imagery
-- Use simple, searchable keywords (e.g., "coffee shop", "laptop coding", "money stack")
-
-TIMING GUIDELINES:
-- Target 25-50 seconds for most clips
-- Use 15-24 seconds only when the moment is exceptionally dense, self-contained, and complete
-- CRITICAL: start_time MUST be different from end_time (minimum 15 seconds apart)
-- Focus on natural content boundaries rather than arbitrary time limits
-- Include enough context for the segment to be understandable
-- Prefer roughly 30-50 seconds when possible
-- Start at the hook or the minimum setup needed to make the hook land, and end after the payoff
-- If a highlight is only one good line, expand to include the surrounding setup and payoff rather than returning a tiny fragment
-- Stop expanding when the topic drifts, the speaker repeats the same point, or the clip loses momentum
-
-TIMESTAMP REQUIREMENTS - EXTREMELY IMPORTANT:
-- Use EXACT timestamps as they appear in the transcript
-- Never modify timestamp format (keep MM:SS structure)
-- start_time MUST be LESS THAN end_time (start_time < end_time)
-- MINIMUM segment duration: 15 seconds (end_time - start_time >= 15 seconds)
-- IDEAL segment duration: 25-50 seconds
-- Look at transcript ranges like [02:25 - 02:35] and use different start/end times
-- NEVER use the same timestamp for both start_time and end_time
-- Example: start_time: "02:25", end_time: "02:35" (NOT "02:25" and "02:25")
-
-SCORING AND OUTPUT RULES:
-- relevance_score should reflect how well the segment works as a standalone short clip, not just whether the topic is generally important
-- Penalize clips that are only quotable but not self-contained, too generic, missing setup, missing payoff, or padded with filler
-- virality_reasoning and reasoning should cite what is actually present in the chosen span
-- summary and key_topics must also stay grounded in the transcript and should not add outside interpretation
-
-Find 2-5 compelling segments that would work well as standalone clips. Quality over quantity: choose fewer stronger segments over filling a quota. Every selected segment must be accurate, self-contained, have proper time ranges, and score high on virality metrics."""
+Rules:
+- Output ONLY JSON, no other text
+- Start with { and end with }
+- No markdown, no explanations, no prose
+- Find 2-5 segments from the transcript
+- Each segment must be 15-60 seconds long"""
 
 _transcript_agent: Optional[Agent[None, str]] = None
 _transcript_agent_signature: Optional[tuple[str | None, ...]] = None
@@ -459,60 +379,18 @@ def get_transcript_agent() -> Agent[None, str]:
 def build_transcript_analysis_prompt(
     transcript: str, include_broll: bool = False, clip_signals: str | None = None
 ) -> str:
-    broll_instruction = ""
-    if include_broll:
-        broll_instruction = (
-            "\n5. Also identify B-roll opportunities for each chosen segment where stock footage could enhance the visual appeal."
-        )
-    signal_section = ""
-    if clip_signals:
-        signal_section = (
-            "\n\nAdditional deterministic signals from transcript/audio analysis:\n"
-            f"{clip_signals}\n\n"
-            "Use these as hints only. They should influence ranking, but every final segment "
-            "must still be a coherent contiguous transcript range."
-        )
-
-    return f"""Analyze this video transcript and identify the most engaging segments for short-form content.
-
-The transcript is formatted as one line per timestamped span, for example:
-[00:12 - 00:21] Spoken text here
-[00:21 - 00:35] More spoken text here
-
-Follow this workflow:
-1. Read the transcript as a sequence of timestamped spans.
-2. Select only contiguous ranges that already exist in the transcript.
-3. Prefer moments with a strong hook, clear payoff, emotional charge, or concrete value.
-4. For each chosen segment, use the earliest timestamp in the selected range as start_time and the latest timestamp in the selected range as end_time.{broll_instruction}
-
-Selection target:
-- Choose 2-5 segments total.
-- Most selected clips should be 25-50 seconds.
-- Only choose a 15-24 second clip when it already contains a full setup and payoff.
-- If a strong moment is shorter than 25 seconds, first try expanding to nearby contiguous transcript lines that add useful context.
-- Skip weak standalone picks: intros, sponsor reads, CTAs, contextless quotes, repeated points, vague setup, and answer fragments that require prior context.
-- Before returning a segment, ask whether a viewer would understand and care without seeing the rest of the source video.
-
-Critical accuracy requirements:
-- Do not fabricate or embellish content.
-- Do not use timestamps that are not present in the transcript.
-- Do not merge separate non-contiguous moments into one segment.
-- segment.text must reflect only the spoken content inside the selected time range.
-- If a span lacks enough context to stand alone, expand to nearby contiguous lines rather than guessing.
-- If there is a tradeoff between "viral" and "accurate", choose accuracy.
-- Do not reject or penalize a segment simply because of the subject matter; stay content-neutral and assess clip quality only.
-{signal_section}
-
-JSON-only output requirements:
-- Return one valid JSON object and nothing else.
-- No Markdown, headings, bullets, code fences, or explanatory text outside JSON.
-- Top-level keys: "most_relevant_segments", "summary", "key_topics"{', "broll_opportunities"' if include_broll else ''}.
-- Segment keys: "start_time", "end_time", "text", "relevance_score", "reasoning", "virality".
-- Virality keys: "hook_score", "engagement_score", "value_score", "shareability_score", "total_score", "hook_type", "virality_reasoning".
-- Do not return segments shorter than {MIN_ACCEPTED_CLIP_SECONDS} seconds or longer than {MAX_ACCEPTED_CLIP_SECONDS} seconds.
+    """Build the prompt for transcript analysis."""
+    return f"""Analyze this transcript and return JSON.
 
 Transcript:
-{transcript}"""
+{transcript}
+
+Return JSON with:
+- most_relevant_segments: 2-5 segments (start_time, end_time, text, relevance_score, reasoning, virality)
+- summary: brief summary
+- key_topics: list of topics
+
+JSON only, no explanations:"""
 
 
 def _parse_transcript_timestamp_seconds(timestamp: str) -> int:
@@ -651,35 +529,39 @@ def _repair_segment_bounds(
 
 
 def _clean_markdown_json(raw_text: str) -> str:
-    """Remove markdown formatting from JSON responses."""
+    """Extract JSON from response, handling markdown code blocks."""
     if not raw_text:
         return ""
     
     text = raw_text.strip()
     
-    if text.startswith("```"):
+    # Handle markdown code blocks
+    if "```" in text:
         lines = text.split("\n")
-        start_idx = 0
-        for i, line in enumerate(lines):
+        in_code = False
+        code_lines = []
+        for line in lines:
             if line.strip().startswith("```"):
-                start_idx = i + 1
-                break
-        
-        end_idx = len(lines)
-        for i in range(len(lines) - 1, -1, -1):
-            if lines[i].strip().startswith("```"):
-                end_idx = i
-                break
-        
-        json_lines = lines[start_idx:end_idx]
-        text = "\n".join(json_lines).strip()
+                in_code = not in_code
+                continue
+            if in_code:
+                code_lines.append(line)
+        if code_lines:
+            text = "\n".join(code_lines).strip()
     
+    # If no code blocks, try to find JSON directly
     json_start = text.find("{")
     json_end = text.rfind("}")
     if json_start != -1 and json_end != -1 and json_start < json_end:
-        text = text[json_start:json_end + 1]
+        return text[json_start:json_end + 1]
     
-    return text
+    # Try to find JSON array
+    array_start = text.find("[")
+    array_end = text.rfind("]")
+    if array_start != -1 and array_end != -1 and array_start < array_end:
+        return text[array_start:array_end + 1]
+    
+    return ""
 
 
 async def get_most_relevant_parts_by_transcript(
@@ -744,6 +626,7 @@ async def get_most_relevant_parts_by_transcript(
     # Clean markdown if present
     cleaned_text = _clean_markdown_json(response_text)
     if not cleaned_text:
+        logger.error(f"Could not extract JSON. Response: {response_text[:500]}")
         raise ValueError("No JSON content found in response")
     
     # Parse into dictionary
@@ -758,6 +641,11 @@ async def get_most_relevant_parts_by_transcript(
     
     # Parse into TranscriptAnalysis with relaxed validation
     analysis = TranscriptAnalysis(**data)
+    
+    # Set default virality for segments that don't have it
+    for segment in analysis.most_relevant_segments:
+        if segment.virality is None:
+            segment.virality = _default_virality_analysis()
     
     # Post-process and validate segments
     transcript_spans = _parse_transcript_spans(transcript_text)
